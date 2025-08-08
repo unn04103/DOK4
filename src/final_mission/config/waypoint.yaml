@@ -1,10 +1,24 @@
-/**:
+offboard_test:
   ros__parameters:
-    WP1_lat: 37.450576
-    WP1_lon: 126.650237
-    WP2_lat: 37.450973
-    WP2_lon: 126.650069
-    WP3_lat: 37.450981
-    WP3_lon: 126.650564
-    WP4_lat: 37.450504
-    WP4_lon: 126.650497
+    # --- Waypoints (relative to ARM altitude) ---
+    wp1.lat: 37.405071
+    wp1.lon: 126.613924
+    wp1.alt_rel: 4.0   # [m] up is positive (NED z will be wp0_z - alt_rel)
+
+    wp2.lat: 37.403633
+    wp2.lon: 126.616342
+    wp2.alt_rel: 4.0
+
+    wp3.lat: 37.403001
+    wp3.lon: 126.614233
+    wp3.alt_rel: 4.0
+
+    wp4.lat: 37.404870
+    wp4.lon: 126.615856
+    wp4.alt_rel: 4.0
+
+    # --- Mission params ---
+    takeoff_alt_rel: 4.0   # vertical climb from ARM z (1 m z tolerance)
+    speed_xy: 2.0           # constant cruise speed between WPs [m/s]
+    xy_tolerance: 2.0       # horizontal tolerance to accept arrival [m]
+    z_tolerance: 1.0        # vertical tolerance [m]

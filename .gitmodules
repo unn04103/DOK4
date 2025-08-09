@@ -2,3 +2,6 @@
 	path = src/px4_msgs
 	url = https://github.com/PX4/px4_msgs.git
 	branch = release/1.15
+[submodule "src/usb_cam"]
+	path = src/usb_cam
+	url = https://github.com/unn04103/usb_cam.git

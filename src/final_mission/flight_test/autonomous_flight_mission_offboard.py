@@ -97,12 +97,23 @@ class OffboardWaypointNode(Node):
         self.start_wp = None  # dict x,y,z
         self.goal_wp = None   # dict x,y,z
 
+        # Throttled debug logger state
+        self._last_log_ns = {}
+
         # Timer at 20 Hz
         self.timer = self.create_timer(0.05, self.timer_cb)
 
         # Load params into raw list
         self._load_params()
         self.get_logger().info('Offboard waypoint node initialized.')
+
+    # ---------- Debug helpers ----------
+    def _log_throttle(self, key: str, text: str, period_s: float = 1.0):
+        now = self.get_clock().now().nanoseconds if self.get_clock() else 0
+        last = self._last_log_ns.get(key, 0)
+        if now - last >= int(period_s * 1e9):
+            self._last_log_ns[key] = now
+            self.get_logger().info(text)
 
     # ---------- Parameter loader ----------
     def _load_params(self):
@@ -111,15 +122,20 @@ class OffboardWaypointNode(Node):
             lat = float(self.get_parameter(f'wp{i}.lat').value)
             lon = float(self.get_parameter(f'wp{i}.lon').value)
             alt_rel = float(self.get_parameter(f'wp{i}.alt_rel').value)
-            # accept only if lat/lon are non-zero (basic sanity)
             if lat != 0.0 or lon != 0.0:
                 self.wp_list_raw.append({'lat': lat, 'lon': lon, 'alt_rel': alt_rel})
         if not self.wp_list_raw:
             self.get_logger().warn('No waypoints provided via parameters (wp1..wp4).')
+        else:
+            for idx, wp in enumerate(self.wp_list_raw, start=1):
+                self.get_logger().info(f"WP{idx} (yaml): lat={wp['lat']:.7f}, lon={wp['lon']:.7f}, alt_rel={wp['alt_rel']:.2f} m")
+            self.get_logger().info(f"Params: speed_xy={self.speed_xy:.2f} m/s, xy_tol={self.xy_tol:.2f} m, z_tol={self.z_tol:.2f} m, takeoff_alt_rel={self.takeoff_alt_rel:.2f} m")
 
     # ---------- Subscribers ----------
     def local_pos_cb(self, msg: VehicleLocalPosition):
         self.local_pos = msg
+        # periodic pose debug
+        self._log_throttle('pose', f"POSE lpos: x={msg.x:.2f} y={msg.y:.2f} z={msg.z:.2f}", 0.5)
         # Latch EKF origin once available
         if not self.origin_set and getattr(msg, 'xy_global', False):
             self.ref_lat_deg = float(msg.ref_lat)  # degrees
@@ -129,15 +145,18 @@ class OffboardWaypointNode(Node):
             self.ref_lon_rad = math.radians(self.ref_lon_deg)
             self.origin_set = True
             self.get_logger().info(
-                f'EKF origin lat/lon/alt set: {self.ref_lat_deg:.7f}, {self.ref_lon_deg:.7f}, {self.ref_alt:.2f}')
+                f'EKF origin set: ref_lat={self.ref_lat_deg:.7f} deg, ref_lon={self.ref_lon_deg:.7f} deg, ref_alt={self.ref_alt:.2f} m')
 
     def status_cb(self, msg: VehicleStatus):
         # Detect ARM rising edge and latch wp0 from local position
         prev_arming = self.status.arming_state if self.status is not None else None
         self.status = msg
+        # periodic status debug
+        self._log_throttle('status', f"STATUS arming={msg.arming_state} nav_state={msg.nav_state}", 1.0)
         if prev_arming is not None and prev_arming != VehicleStatus.ARMING_STATE_ARMED \
            and msg.arming_state == VehicleStatus.ARMING_STATE_ARMED and not self.arm_set:
             if self.local_pos is None or not self.origin_set:
+                self.get_logger().warn('ARM detected but local_pos/origin not ready; waiting...')
                 return  # will retry in timer
             self.wp0_ned = {
                 'x': float(self.local_pos.x),
@@ -155,22 +174,26 @@ class OffboardWaypointNode(Node):
             return False
         # Build WP1..WP4 in NED using alt_rel from ARM altitude (use local z at ARM)
         self.wps_ned = []
-        for wp in self.wp_list_raw:
+        for idx, wp in enumerate(self.wp_list_raw, start=1):
             x, y = geometry_utils.wgs84_to_ned(wp['lat'], wp['lon'],
                                                self.ref_lat_rad, self.ref_lon_rad)
             z = self.wp0_z - float(wp['alt_rel'])  # NED(+down): up is negative
             self.wps_ned.append({'x': x, 'y': y, 'z': z})
+            self.get_logger().info(f"WP{idx} (NED): x={x:.2f} y={y:.2f} z={z:.2f}")
         # Takeoff target directly above wp0
         self.takeoff_ned = {
             'x': self.wp0_ned['x'],
             'y': self.wp0_ned['y'],
             'z': self.wp0_z - float(self.takeoff_alt_rel),
         }
+        self.get_logger().info(
+            f"TAKEOFF target (NED): x={self.takeoff_ned['x']:.2f} y={self.takeoff_ned['y']:.2f} z={self.takeoff_ned['z']:.2f}")
         return True
 
     def _publish_position_sp(self, x, y, z, yaw):
         vehicle_command.publish_heartbeat_ob_pos_sp(self.ctrl_mode_pub, self.get_clock())
         vehicle_command.publish_position_setpoint(self.sp_pub, x, y, z, yaw, self.get_clock())
+        self._log_throttle('sp', f"SETPOINT x={x:.2f} y={y:.2f} z={z:.2f} yaw_deg={yaw:.1f}", 0.5)
 
     def _leg_init(self, start_wp: dict, goal_wp: dict, speed_xy: float):
         self.start_wp = start_wp.copy()
@@ -196,6 +219,10 @@ class OffboardWaypointNode(Node):
         if self.local_pos is not None:
             cur = {'x': self.local_pos.x, 'y': self.local_pos.y}
             yaw = self._yaw_to_target_deg(cur, self.goal_wp)
+            total_dist, dist_xy, dist_z = geometry_utils.get_distance_between_ned(
+                self.local_pos.x, self.local_pos.y, self.local_pos.z,
+                self.goal_wp['x'], self.goal_wp['y'], self.goal_wp['z'])
+            self._log_throttle('prog', f"PROG leg={self.leg} t={t:.2f} dist_xy={dist_xy:.2f} dz={dist_z:.2f}", 0.5)
         else:
             yaw = 0.0
         self._publish_position_sp(x, y, z, yaw)
@@ -221,6 +248,8 @@ class OffboardWaypointNode(Node):
                 vehicle_command.arm(self.cmd_pub, self.get_clock())
                 self.state = 'WAIT_ARM'
                 self.state_changed = True
+            else:
+                self._log_throttle('wait', 'Waiting origin/parameters...', 1.0)
             return
 
         # Wait until ARM latched (wp0) then build NED WPs
@@ -240,6 +269,8 @@ class OffboardWaypointNode(Node):
                 self.get_logger().info('Waypoints converted to NED. TAKEOFF...')
                 self.state = 'TAKEOFF'
                 self.state_changed = True
+            else:
+                self._log_throttle('wait_arm', 'Waiting ARM to latch wp0...', 1.0)
             return
 
         # TAKEOFF: vertical climb at wp0 (x0,y0) to takeoff altitude
@@ -248,6 +279,8 @@ class OffboardWaypointNode(Node):
                 start = {'x': float(self.local_pos.x), 'y': float(self.local_pos.y), 'z': float(self.local_pos.z)}
                 goal = {'x': self.takeoff_ned['x'], 'y': self.takeoff_ned['y'], 'z': self.takeoff_ned['z']}
                 self._leg_init(start, goal, speed_xy=max(0.5, self.speed_xy))
+                self.get_logger().info(
+                    f"TAKEOFF init: start=({start['x']:.2f},{start['y']:.2f},{start['z']:.2f}) -> goal=({goal['x']:.2f},{goal['y']:.2f},{goal['z']:.2f}), dur={self.duration_ns/1e9:.1f}s")
             t = self._interpolate_and_publish()
             # Height-only tolerance = z_tol (1 m)
             if geometry_utils.is_height_reached(self.local_pos.z, self.takeoff_ned['z'], self.z_tol) or t >= 1.0:
@@ -264,6 +297,8 @@ class OffboardWaypointNode(Node):
                 if self.state_changed:
                     start = {'x': self.local_pos.x, 'y': self.local_pos.y, 'z': self.local_pos.z}
                     self._leg_init(start, target, speed_xy=self.speed_xy)
+                    self.get_logger().info(
+                        f"LEG init (WP{self.leg+1}): start=({start['x']:.2f},{start['y']:.2f},{start['z']:.2f}) -> target=({target['x']:.2f},{target['y']:.2f},{target['z']:.2f}), dur={self.duration_ns/1e9:.1f}s")
                 t = self._interpolate_and_publish()
                 if self._within_tolerance(target) or t >= 1.0:
                     self.leg += 1
@@ -281,6 +316,8 @@ class OffboardWaypointNode(Node):
             if self.state_changed:
                 start = {'x': self.local_pos.x, 'y': self.local_pos.y, 'z': self.local_pos.z}
                 self._leg_init(start, target, speed_xy=self.speed_xy)
+                self.get_logger().info(
+                    f"RTL init: start=({start['x']:.2f},{start['y']:.2f},{start['z']:.2f}) -> target=({target['x']:.2f},{target['y']:.2f},{target['z']:.2f}), dur={self.duration_ns/1e9:.1f}s")
             t = self._interpolate_and_publish()
             if self._within_tolerance(target) or t >= 1.0:
                 self.get_logger().info('At wp0 above, initiating LAND')
@@ -292,6 +329,7 @@ class OffboardWaypointNode(Node):
             # Hold above wp0 and send LAND command
             self._publish_position_sp(self.wp0_ned['x'], self.wp0_ned['y'], self.takeoff_ned['z'], 0.0)
             vehicle_command.land(self.cmd_pub, self.get_clock())
+            self._log_throttle('land', 'LAND command sent; holding above wp0', 1.0)
             return
 
 
